@@ -1,0 +1,742 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  AWS CIS Benchmarks Notification template.
+  
+Parameters:
+  Email:
+    Type: String
+    Default: ''
+    Description: Where CIS alarms notifications should be sent.
+  TrailLogGroupName:
+    Type: String
+    Default: CloudTrail/DefaultLogGroup
+    AllowedPattern: '[\w-/.]+'
+    Description: The name for your CloudTrail LogGroup.
+Mappings:
+  FilterAlarmNames:
+    CIS-API:
+      metric: unauthorized_api_calls_metric
+      alarm: unauthorized_api_calls_alarm
+    CIS-NOMFA:
+      metric: no_mfa_console_signin_metric
+      alarm: no_mfa_console_signin_alarm
+    CIS-ROOTUSAGE:
+      metric: root_usage_metric
+      alarm: root_usage_alarm
+    CIS-IAMCHANGES:
+      metric: iam_changes_metric
+      alarm: iam_changes_alarm
+    CIS-CLOUDTRAIL:
+      metric: cloudtrail_cfg_changes_metric
+      alarm: cloudtrail_cfg_changes_alarm
+    CIS-CONSOLELOGIN:
+      metric: console_signin_failure_metric
+      alarm: console_signin_failure_alarm
+    CIS-CMK:
+      metric: disable_or_delete_cmk_metric
+      alarm: disable_or_delete_cmk_alarm
+    CIS-S3policy:
+      metric: s3_bucket_policy_changes_metric
+      alarm: s3_bucket_policy_changes_alarm
+    CIS-AWSCONFIG:
+      metric: aws_config_changes_metric
+      alarm: aws_config_changes_alarm
+    CIS-SECURITYGROUP:
+      metric: security_group_changes_metric
+      alarm: security_group_changes_alarm
+    CIS-NACLCHANGES:
+      metric: nacl_changes_metric
+      alarm: nacl_changes_alarm
+    CIS-NGW:
+      metric: network_gw_changes_metric
+      alarm: network_gw_changes_alarm
+    CIS-RoutetableChange:
+      metric: route_table_changes_metric
+      alarm: route_table_changes_alarm
+    CIS-VPCCHANGE:
+      metric: vpc_changes_metric
+      alarm: vpc_changes_alarm
+Conditions:
+  NoGlacierSupport: !Equals 
+    - !Ref 'AWS::Region'
+    - sa-east-1
+Resources:
+  CloudTrailS3Bucket:
+    DeletionPolicy: Retain
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Join 
+        - '-'
+        - - cloudtrail
+          - !Ref 'AWS::AccountId'
+          - logs
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveRule
+            Status: Enabled
+            ExpirationInDays: '365'
+            Transition: !If 
+              - NoGlacierSupport
+              - !Ref 'AWS::NoValue'
+              - TransitionInDays: '90'
+                StorageClass: Glacier
+  CloudTrailS3BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    DependsOn:
+      - CloudTrailS3Bucket
+    Properties:
+      Bucket: !Ref CloudTrailS3Bucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 's3:GetBucketAcl'
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref CloudTrailS3Bucket
+          - Sid: AWSCloudTrailWrite20150319
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Join 
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref CloudTrailS3Bucket
+                - /AWSLogs/
+                - !Ref 'AWS::AccountId'
+                - /*
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+  TrailLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Ref TrailLogGroupName
+      RetentionInDays: 90
+  TrailLogGroupRole:
+    Type: 'AWS::IAM::Role'
+    DependsOn:
+      - TrailLogGroup
+    Properties:
+      RoleName: trail-log-role
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - cloudtrail.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: trail-log-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !GetAtt 
+                  - TrailLogGroup
+                  - Arn
+  Trail:
+    Type: 'AWS::CloudTrail::Trail'
+    DependsOn:
+      - CloudTrailS3BucketPolicy
+      - TrailLogGroup
+      - TrailLogGroupRole
+    Properties:
+      TrailName: cis_benchmark_trail
+      S3BucketName: !Ref CloudTrailS3Bucket
+      IsLogging: true
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      CloudWatchLogsLogGroupArn: !GetAtt 
+        - TrailLogGroup
+        - Arn
+      CloudWatchLogsRoleArn: !GetAtt 
+        - TrailLogGroupRole
+        - Arn
+  AlarmTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: cis_benchmark_topic
+      Subscription:
+        - Endpoint: !Ref Email
+          Protocol: email
+  CIS3MetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    DependsOn:
+      - TrailLogGroup
+    Properties:
+      FilterPattern: >-
+        {($.errorCode = "*UnauthorizedOperation") || ($.errorCode =
+        "AccessDenied*" )}
+      LogGroupName: !Ref TrailLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricNamespace: CISBenchmark
+          MetricName: !FindInMap 
+            - FilterAlarmNames
+            - CIS-API
+            - metric
+  CISAPICloudWatchAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn:
+      - AlarmTopic
+    Properties:
+      AlarmName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-API
+        - alarm
+      AlarmDescription: Alarm for unauthorized API calls (Scored)
+      AlarmActions:
+        - !Ref AlarmTopic
+      MetricName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-API
+        - metric
+      Namespace: CISBenchmark
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+  CISNOMFAMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    DependsOn:
+      - TrailLogGroup
+    Properties:
+      FilterPattern: >-
+        {( $.eventName = "ConsoleLogin" ) && ( $.additionalEventData.MFAUsed !=
+        "Yes" )}
+      LogGroupName: !Ref TrailLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricNamespace: CISBenchmark
+          MetricName: !FindInMap 
+            - FilterAlarmNames
+            - CIS-NOMFA
+            - metric
+  CISNOMFACloudWatchAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn:
+      - AlarmTopic
+    Properties:
+      AlarmName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-NOMFA
+        - alarm
+      AlarmDescription: Alarm for Management Console sign-in without MFA (Scored)
+      AlarmActions:
+        - !Ref AlarmTopic
+      MetricName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-NOMFA
+        - metric
+      Namespace: CISBenchmark
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+  CISROOTUSAGEMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    DependsOn:
+      - TrailLogGroup
+    Properties:
+      FilterPattern: >-
+        {( $.userIdentity.type = "Root" ) && ( $.userIdentity.invokedBy NOT
+        EXISTS ) && ( $.eventType != "AwsServiceEvent" )}
+      LogGroupName: !Ref TrailLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricNamespace: CISBenchmark
+          MetricName: !FindInMap 
+            - FilterAlarmNames
+            - CIS-ROOTUSAGE
+            - metric
+  CISROOTUSAGECloudWatchAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn:
+      - AlarmTopic
+    Properties:
+      AlarmName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-ROOTUSAGE
+        - alarm
+      AlarmDescription: Alarm for usage of root account (Scored)
+      AlarmActions:
+        - !Ref AlarmTopic
+      MetricName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-ROOTUSAGE
+        - metric
+      Namespace: CISBenchmark
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+  CISIAMCHANGESMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    DependsOn:
+      - TrailLogGroup
+    Properties:
+      FilterPattern: >-
+        {($.eventName = DeleteGroupPolicy) || ($.eventName = DeleteRolePolicy)
+        || ($.eventName = DeleteUserPolicy) || ($.eventName = PutGroupPolicy) ||
+        ($.eventName = PutRolePolicy) || ($.eventName = PutUserPolicy) ||
+        ($.eventName = CreatePolicy) || ($.eventName = DeletePolicy) ||
+        ($.eventName = CreatePolicyVersion) || ($.eventName =
+        DeletePolicyVersion) || ($.eventName = AttachRolePolicy) || ($.eventName
+        = DetachRolePolicy) || ($.eventName = AttachUserPolicy) || ($.eventName
+        = DetachUserPolicy) || ($.eventName = AttachGroupPolicy) || ($.eventName
+        = DetachGroupPolicy)}
+      LogGroupName: !Ref TrailLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricNamespace: CISBenchmark
+          MetricName: !FindInMap 
+            - FilterAlarmNames
+            - CIS-IAMCHANGES
+            - metric
+  CISIAMCHANGESCloudWatchAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn:
+      - AlarmTopic
+    Properties:
+      AlarmName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-IAMCHANGES
+        - alarm
+      AlarmDescription: Alarm for IAM policy changes (Scored)
+      AlarmActions:
+        - !Ref AlarmTopic
+      MetricName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-IAMCHANGES
+        - metric
+      Namespace: CISBenchmark
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+  CISCLOUDTRAILMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    DependsOn:
+      - TrailLogGroup
+    Properties:
+      FilterPattern: >-
+        {($.eventName = CreateTrail) || ($.eventName = UpdateTrail) ||
+        ($.eventName = DeleteTrail) || ($.eventName = StartLogging) ||
+        ($.eventName = StopLogging)}
+      LogGroupName: !Ref TrailLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricNamespace: CISBenchmark
+          MetricName: !FindInMap 
+            - FilterAlarmNames
+            - CIS-CLOUDTRAIL
+            - metric
+  CISCLOUDTRAILCloudWatchAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn:
+      - AlarmTopic
+    Properties:
+      AlarmName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-CLOUDTRAIL
+        - alarm
+      AlarmDescription: Alarm for CloudTrail configuration changes (Scored)
+      AlarmActions:
+        - !Ref AlarmTopic
+      MetricName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-CLOUDTRAIL
+        - metric
+      Namespace: CISBenchmark
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+  CISCONSOLELOGINMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    DependsOn:
+      - TrailLogGroup
+    Properties:
+      FilterPattern: >-
+        {($.eventName = ConsoleLogin) && ($.errorMessage = "Failed
+        authentication")}
+      LogGroupName: !Ref TrailLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricNamespace: CISBenchmark
+          MetricName: !FindInMap 
+            - FilterAlarmNames
+            - CIS-CONSOLELOGIN
+            - metric
+  CISCONSOLELOGINCloudWatchAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn:
+      - AlarmTopic
+    Properties:
+      AlarmName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-CONSOLELOGIN
+        - alarm
+      AlarmDescription: Alarm for AWS Management Console authentication failures (Scored)
+      AlarmActions:
+        - !Ref AlarmTopic
+      MetricName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-CONSOLELOGIN
+        - metric
+      Namespace: CISBenchmark
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+  CISCMKMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    DependsOn:
+      - TrailLogGroup
+    Properties:
+      FilterPattern: >-
+        {($.eventSource = kms.amazonaws.com) && (($.eventName = DisableKey) ||
+        ($.eventName = ScheduleKeyDeletion))}
+      LogGroupName: !Ref TrailLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricNamespace: CISBenchmark
+          MetricName: !FindInMap 
+            - FilterAlarmNames
+            - CIS-CMK
+            - metric
+  CISCMKCloudWatchAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn:
+      - AlarmTopic
+    Properties:
+      AlarmName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-CMK
+        - alarm
+      AlarmDescription: >-
+        Alarm for disabling or scheduled deletion of customer created CMKs
+        (Scored)
+      AlarmActions:
+        - !Ref AlarmTopic
+      MetricName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-CMK
+        - metric
+      Namespace: CISBenchmark
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+  CISS3policyMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    DependsOn:
+      - TrailLogGroup
+    Properties:
+      FilterPattern: >-
+        {($.eventSource = s3.amazonaws.com) && (($.eventName = PutBucketAcl) ||
+        ($.eventName = PutBucketPolicy) || ($.eventName = PutBucketCors) ||
+        ($.eventName = PutBucketLifecycle) || ($.eventName =
+        PutBucketReplication) || ($.eventName = DeleteBucketPolicy) ||
+        ($.eventName = DeleteBucketCors) || ($.eventName =
+        DeleteBucketLifecycle) || ($.eventName = DeleteBucketReplication))}
+      LogGroupName: !Ref TrailLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricNamespace: CISBenchmark
+          MetricName: !FindInMap 
+            - FilterAlarmNames
+            - CIS-S3policy
+            - metric
+  CISS3policyCloudWatchAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn:
+      - AlarmTopic
+    Properties:
+      AlarmName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-S3policy
+        - alarm
+      AlarmDescription: Alarm for S3 bucket policy changes (Scored)
+      AlarmActions:
+        - !Ref AlarmTopic
+      MetricName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-S3policy
+        - metric
+      Namespace: CISBenchmark
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+  CISAWSCONFIGMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    DependsOn:
+      - TrailLogGroup
+    Properties:
+      FilterPattern: >-
+        {($.eventSource = config.amazonaws.com) && (($.eventName =
+        StopConfigurationRecorder) || ($.eventName = DeleteDeliveryChannel) ||
+        ($.eventName = PutDeliveryChannel) || ($.eventName =
+        PutConfigurationRecorder))}
+      LogGroupName: !Ref TrailLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricNamespace: CISBenchmark
+          MetricName: !FindInMap 
+            - FilterAlarmNames
+            - CIS-AWSCONFIG
+            - metric
+  CISAWSCONFIGCloudWatchAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn:
+      - AlarmTopic
+    Properties:
+      AlarmName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-AWSCONFIG
+        - alarm
+      AlarmDescription: Alarm for AWS Config configuration changes (Scored)
+      AlarmActions:
+        - !Ref AlarmTopic
+      MetricName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-AWSCONFIG
+        - metric
+      Namespace: CISBenchmark
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+  CISSECURITYGROUPMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    DependsOn:
+      - TrailLogGroup
+    Properties:
+      FilterPattern: >-
+        {($.eventName = AuthorizeSecurityGroupIngress) || ($.eventName =
+        AuthorizeSecurityGroupEgress) || ($.eventName =
+        RevokeSecurityGroupIngress) || ($.eventName = RevokeSecurityGroupEgress)
+        || ($.eventName = CreateSecurityGroup) || ($.eventName =
+        DeleteSecurityGroup)}
+      LogGroupName: !Ref TrailLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricNamespace: CISBenchmark
+          MetricName: !FindInMap 
+            - FilterAlarmNames
+            - CIS-SECURITYGROUP
+            - metric
+  CISSECURITYGROUPCloudWatchAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn:
+      - AlarmTopic
+    Properties:
+      AlarmName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-SECURITYGROUP
+        - alarm
+      AlarmDescription: Alarm for security group changes (Scored)
+      AlarmActions:
+        - !Ref AlarmTopic
+      MetricName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-SECURITYGROUP
+        - metric
+      Namespace: CISBenchmark
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+  CISNACLCHANGESMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    DependsOn:
+      - TrailLogGroup
+    Properties:
+      FilterPattern: >-
+        {($.eventName = CreateNetworkAcl) || ($.eventName =
+        CreateNetworkAclEntry) || ($.eventName = DeleteNetworkAcl) ||
+        ($.eventName = DeleteNetworkAclEntry) || ($.eventName =
+        ReplaceNetworkAclEntry) || ($.eventName = ReplaceNetworkAclAssociation)}
+      LogGroupName: !Ref TrailLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricNamespace: CISBenchmark
+          MetricName: !FindInMap 
+            - FilterAlarmNames
+            - CIS-NACLCHANGES
+            - metric
+  CISNACLCHANGESCloudWatchAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn:
+      - AlarmTopic
+    Properties:
+      AlarmName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-NACLCHANGES
+        - alarm
+      AlarmDescription: Alarm for changes to Network Access Control Lists (Scored)
+      AlarmActions:
+        - !Ref AlarmTopic
+      MetricName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-NACLCHANGES
+        - metric
+      Namespace: CISBenchmark
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+  CISNGWMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    DependsOn:
+      - TrailLogGroup
+    Properties:
+      FilterPattern: >-
+        {($.eventName = CreateCustomerGateway) || ($.eventName =
+        DeleteCustomerGateway) || ($.eventName = AttachInternetGateway) ||
+        ($.eventName = CreateInternetGateway) || ($.eventName =
+        DeleteInternetGateway) || ($.eventName = DetachInternetGateway)}
+      LogGroupName: !Ref TrailLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricNamespace: CISBenchmark
+          MetricName: !FindInMap 
+            - FilterAlarmNames
+            - CIS-NGW
+            - metric
+  CISNGWCloudWatchAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn:
+      - AlarmTopic
+    Properties:
+      AlarmName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-NGW
+        - alarm
+      AlarmDescription: Alarm for changes to network gateways (Scored)
+      AlarmActions:
+        - !Ref AlarmTopic
+      MetricName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-NGW
+        - metric
+      Namespace: CISBenchmark
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+  CISRoutetableChangeMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    DependsOn:
+      - TrailLogGroup
+    Properties:
+      FilterPattern: >-
+        {($.eventName = CreateRoute) || ($.eventName = CreateRouteTable) ||
+        ($.eventName = ReplaceRoute) || ($.eventName =
+        ReplaceRouteTableAssociation) || ($.eventName = DeleteRouteTable) ||
+        ($.eventName = DeleteRoute) || ($.eventName = DisassociateRouteTable)}
+      LogGroupName: !Ref TrailLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricNamespace: CISBenchmark
+          MetricName: !FindInMap 
+            - FilterAlarmNames
+            - CIS-RoutetableChange
+            - metric
+  CISRoutetableChangeCloudWatchAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn:
+      - AlarmTopic
+    Properties:
+      AlarmName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-RoutetableChange
+        - alarm
+      AlarmDescription: Alarm for route table changes (Scored)
+      AlarmActions:
+        - !Ref AlarmTopic
+      MetricName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-RoutetableChange
+        - metric
+      Namespace: CISBenchmark
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+  CISVPCCHANGEMetricFilter:
+    Type: 'AWS::Logs::MetricFilter'
+    DependsOn:
+      - TrailLogGroup
+    Properties:
+      FilterPattern: >-
+        {($.eventName = CreateVpc) || ($.eventName = DeleteVpc) || ($.eventName
+        = ModifyVpcAttribute) || ($.eventName = AcceptVpcPeeringConnection) ||
+        ($.eventName = CreateVpcPeeringConnection) || ($.eventName =
+        DeleteVpcPeeringConnection) || ($.eventName =
+        RejectVpcPeeringConnection) || ($.eventName = AttachClassicLinkVpc) ||
+        ($.eventName = DetachClassicLinkVpc) || ($.eventName =
+        DisableVpcClassicLink) || ($.eventName = EnableVpcClassicLink)}
+      LogGroupName: !Ref TrailLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricNamespace: CISBenchmark
+          MetricName: !FindInMap 
+            - FilterAlarmNames
+            - CIS-VPCCHANGE
+            - metric
+  CISVPCCHANGECloudWatchAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    DependsOn:
+      - AlarmTopic
+    Properties:
+      AlarmName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-VPCCHANGE
+        - alarm
+      AlarmDescription: Alarm for VPC changes (Scored)
+      AlarmActions:
+        - !Ref AlarmTopic
+      MetricName: !FindInMap 
+        - FilterAlarmNames
+        - CIS-VPCCHANGE
+        - metric
+      Namespace: CISBenchmark
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      Threshold: 1
+Outputs:
+  TrailBucket:
+    Description: S3 CloudTrail Bucket
+    Value: !Ref CloudTrailS3Bucket
+  TrailName:
+    Description: CloudTrail Trail Name
+    Value: !Ref Trail
