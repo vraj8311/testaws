@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: 2010-09-09
-Description: HIDS CloudWatch Logs ElasticSearch Stack
+Description: HIDS CloudWatch Logs Stack
 Mappings:
   RegionMap:
     us-east-1:
